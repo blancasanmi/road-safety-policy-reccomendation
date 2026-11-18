@@ -1,12 +1,15 @@
 """
-periph_analysis.py
-==================
-Filters the BAAC data to the communes bordering the Paris périphérique and
-aggregates all tables.
+commune_analysis.py
+===================
+Filters the BAAC data to a set of communes (here: those bordering the Paris
+périphérique) and aggregates all tables by commune around two rules:
+
+    1. Severity      -> severe_per_100_accidents
+    2. Vulnerability -> pct_vulnerable_accidents (pedestrians and cyclists)
 
 Usage:
-    python periph_analysis.py --year 2025 --out output_periph
-    python periph_analysis.py --year 2025 --include-paris
+    python commune_analysis.py --year 2025 --out output_communes
+    python commune_analysis.py --year 2025 --include-paris
 """
 from __future__ import annotations
 
@@ -33,18 +36,17 @@ PERIPH_COMMUNES: dict[str, str] = {
     "94080": "Vincennes", "94067": "Saint-Mandé", "94018": "Charenton-le-Pont",
     "94041": "Ivry-sur-Seine", "94043": "Le Kremlin-Bicêtre", "94037": "Gentilly",
 }
-# Paris is stored as '75' in the `com` column of this file (checked manually);
-# the 5-digit code is mapped too, in case other years differ.
 
 
 def name_resolver(dep: str, com: str) -> str | None:
     """Fallback naming for codes not in PERIPH_COMMUNES.
     Every accident of department 75 is labelled 'Paris', whatever the code
     ('75', '75056', or an arrondissement code such as '75116')."""
-    return "Paris" if dep == "75" else None
+    dep, com = str(dep).strip(), str(com).strip()
+    return "Paris" if dep.startswith("75") or com.startswith("75") else None
 
 
-class PeripheryAggregator:
+class CommuneAggregator:
     """Builds accident-level and grouped tables from a filtered BAACDataset.
 
     The dataset must have geography attached (dataset.attach_geography(...)),
@@ -54,6 +56,12 @@ class PeripheryAggregator:
     GRAV = {1: "unharmed", 2: "killed", 3: "hospitalised", 4: "light_injury"}
     CATU = {1: "driver", 2: "passenger", 3: "pedestrian"}
     AGE_COL = "V - Age Véhicule"
+
+    # Vulnerability = pedestrians + cyclists.
+    # catu 3 = pedestrian. catv 1 = bicycle, 80 = e-bike (VAE).
+    # Verify these codes against the 2025 data dictionary.
+    PEDESTRIAN_CATU = 3
+    CYCLIST_CATV = {1, 80}
 
     def __init__(self, dataset: BAACDataset):
         self.ds = dataset
@@ -71,7 +79,13 @@ class PeripheryAggregator:
         base = base.merge(lieux.drop_duplicates("Num_Acc"), on="Num_Acc",
                           how="left", suffixes=("", "_lieux"), validate="one_to_one")
 
-        u = self.ds.usagers
+        # Users, with the category of the vehicle they were in (to spot cyclists)
+        veh_cat = (self.ds.vehicules[["Num_Acc", "num_veh", "catv"]]
+                   .drop_duplicates(["Num_Acc", "num_veh"]))
+        u = self.ds.usagers.merge(veh_cat, on=["Num_Acc", "num_veh"], how="left")
+        is_pedestrian = u["catu"].eq(self.PEDESTRIAN_CATU)
+        is_cyclist = ~is_pedestrian & u["catv"].isin(self.CYCLIST_CATV)
+
         flags = pd.DataFrame({
             "Num_Acc": u["Num_Acc"],
             "n_users": 1,
@@ -79,7 +93,8 @@ class PeripheryAggregator:
             "killed": u["grav"].eq(2).astype(int),
             "hospitalised": u["grav"].eq(3).astype(int),
             "light_injury": u["grav"].eq(4).astype(int),
-            "pedestrians": u["catu"].eq(3).astype(int),
+            "pedestrians": is_pedestrian.astype(int),
+            "cyclists": is_cyclist.astype(int),
         })
         base = base.merge(flags.groupby("Num_Acc").sum(), on="Num_Acc", how="left")
 
@@ -95,8 +110,12 @@ class PeripheryAggregator:
             pass
 
         count_cols = ["n_users", "unharmed", "killed", "hospitalised",
-                      "light_injury", "pedestrians", "n_vehicles"]
+                      "light_injury", "pedestrians", "cyclists", "n_vehicles"]
         base[count_cols] = base[count_cols].fillna(0).astype(int)
+
+        # Accident-level flag used by the vulnerability rule
+        base["vulnerable_involved"] = (base["pedestrians"] + base["cyclists"]) > 0
+
         self._accidents = base
         return base
 
@@ -112,10 +131,21 @@ class PeripheryAggregator:
             light_injury=("light_injury", "sum"),
             unharmed=("unharmed", "sum"),
             pedestrians=("pedestrians", "sum"),
+            cyclists=("cyclists", "sum"),
+            vulnerable_accidents=("vulnerable_involved", "sum"),
         )
+
+        # Rule 1 - severity: killed + hospitalised people per 100 accidents
         out["severe_per_100_accidents"] = (
             (out["killed"] + out["hospitalised"]) / out["accidents"] * 100
         ).round(1)
+
+        # Rule 2 - vulnerability: % of accidents involving at least one
+        # pedestrian or cyclist
+        out["pct_vulnerable_accidents"] = (
+            out["vulnerable_accidents"] / out["accidents"] * 100
+        ).round(1)
+
         return out.sort_values("accidents", ascending=False)
 
     def by_month(self) -> pd.DataFrame:
@@ -173,7 +203,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--year", type=int, default=2025)
     parser.add_argument("--include-paris", action="store_true")
-    parser.add_argument("--out", default="output_periph")
+    parser.add_argument("--out", default="output_communes")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -185,7 +215,7 @@ def main() -> None:
     print(ring)
     print(ring.summary())
 
-    agg = PeripheryAggregator(ring)
+    agg = CommuneAggregator(ring)
     print(agg.by_commune())
     agg.export(args.out)
     print(f"\nExported to {Path(args.out).resolve()}")

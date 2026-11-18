@@ -201,6 +201,29 @@ class BAACDataset:
             log.warning("Communes with no accident: %s", not_found)
         return self.filter_by_accidents(c.loc[mask, "Num_Acc"])
 
+    def filter_by_departments(
+        self,
+        departments: Iterable[str],
+    ) -> "BAACDataset":
+        """Keep accidents whose `dep` is in `departments`.
+
+        Example: ``ds.filter_by_departments(ILE_DE_FRANCE_DEPS)``
+        """
+        deps = {str(d) for d in departments}
+        c = self.caract
+        mask = c["dep"].isin(deps)
+        if not mask.any():
+            raise ValueError(
+                "No accident matched the departments "
+                f"{sorted(deps)}. Sample dep values in the data: "
+                f"{c['dep'].drop_duplicates().head(10).tolist()}"
+            )
+        log.info(
+            "Keeping %d accidents in departments %s (out of %d total)",
+            mask.sum(), sorted(deps), len(c),
+        )
+        return self.filter_by_accidents(c.loc[mask, "Num_Acc"])
+
     # ---- enrichment ---------------------------------------------------
     @staticmethod
     def _label_communes(geo: pd.DataFrame, names, resolver) -> pd.Series:
