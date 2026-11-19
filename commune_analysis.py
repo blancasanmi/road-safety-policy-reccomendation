@@ -1,15 +1,15 @@
 """
 commune_analysis.py
 ===================
-Filters the BAAC data to a set of communes (here: those bordering the Paris
-périphérique) and aggregates all tables by commune around two rules:
+Filters the BAAC data to the whole Île-de-France region (all communes of
+departments 75, 77, 78, 91, 92, 93, 94, 95) and aggregates all tables by
+commune code (`com`, kept as it is in the file, no renaming) around two rules:
 
     1. Severity      -> severe_per_100_accidents
     2. Vulnerability -> pct_vulnerable_accidents (pedestrians and cyclists)
 
 Usage:
     python commune_analysis.py --year 2025 --out output_communes
-    python commune_analysis.py --year 2025 --include-paris
 """
 from __future__ import annotations
 
@@ -18,44 +18,47 @@ import logging
 from pathlib import Path
 
 import pandas as pd
+import requests
 
 from baac import BAACDataset
 
-# INSEE codes written from memory: verify them with the geometry check
-# (communes touching the Paris polygon) before relying on the results.
-PERIPH_COMMUNES: dict[str, str] = {
-    # 92 Hauts-de-Seine
-    "92051": "Neuilly-sur-Seine", "92044": "Levallois-Perret", "92024": "Clichy",
-    "92012": "Boulogne-Billancourt", "92040": "Issy-les-Moulineaux",
-    "92075": "Vanves", "92046": "Malakoff", "92049": "Montrouge",
-    # 93 Seine-Saint-Denis
-    "93070": "Saint-Ouen-sur-Seine", "93066": "Saint-Denis", "93001": "Aubervilliers",
-    "93055": "Pantin", "93061": "Le Pré-Saint-Gervais", "93045": "Les Lilas",
-    "93006": "Bagnolet", "93048": "Montreuil",
-    # 94 Val-de-Marne
-    "94080": "Vincennes", "94067": "Saint-Mandé", "94018": "Charenton-le-Pont",
-    "94041": "Ivry-sur-Seine", "94043": "Le Kremlin-Bicêtre", "94037": "Gentilly",
-}
+log = logging.getLogger(__name__)
+
+IDF_DEPARTMENTS = ["75", "77", "78", "91", "92", "93", "94", "95"]
 
 
-def name_resolver(dep: str, com: str) -> str | None:
-    """Fallback naming for codes not in PERIPH_COMMUNES.
-    Every accident of department 75 is labelled 'Paris', whatever the code
-    ('75', '75056', or an arrondissement code such as '75116')."""
-    dep, com = str(dep).strip(), str(com).strip()
-    return "Paris" if dep.startswith("75") or com.startswith("75") else None
+IDF_REGION_CODE = "11"   # INSEE code of the Île-de-France region
+
+
+def fetch_idf_communes(region_code: str = IDF_REGION_CODE, timeout: int = 60,
+                       with_names: bool = False) -> pd.DataFrame | None:
+    """Official list of communes of a region (columns: com, dep[, name]).
+
+    Used as the reference to also list communes with 0 accidents.
+    Returns None if the call fails (no internet / API error).
+    """
+    fields = "code,codeDepartement" + (",nom" if with_names else "")
+    url = f"https://geo.api.gouv.fr/communes?codeRegion={region_code}&fields={fields}"
+    try:
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        return pd.DataFrame(r.json()).rename(
+            columns={"code": "com", "codeDepartement": "dep", "nom": "name"})
+    except requests.RequestException as exc:
+        log.warning("Could not fetch the official commune list (%s)", exc)
+        return None
 
 
 class CommuneAggregator:
     """Builds accident-level and grouped tables from a filtered BAACDataset.
 
     The dataset must have geography attached (dataset.attach_geography(...)),
-    so that every table carries `commune_name`.
+    so that every table carries `dep` and `com`.
     """
 
     GRAV = {1: "unharmed", 2: "killed", 3: "hospitalised", 4: "light_injury"}
     CATU = {1: "driver", 2: "passenger", 3: "pedestrian"}
-    AGE_COL = "V - Age Véhicule"
+    AGE_COLS = ("V - Age Véhicule", "Age véhicule")   # 2025 / 2022-2024 registration files
 
     # Vulnerability = pedestrians + cyclists.
     # catu 3 = pedestrian. catv 1 = bicycle, 80 = e-bike (VAE).
@@ -63,8 +66,13 @@ class CommuneAggregator:
     PEDESTRIAN_CATU = 3
     CYCLIST_CATV = {1, 80}
 
-    def __init__(self, dataset: BAACDataset):
+    def __init__(self, dataset: BAACDataset,
+                 reference_communes: pd.DataFrame | None = None):
+        """`reference_communes`: DataFrame with columns `com` and `dep` listing
+        every commune expected in the area (see fetch_idf_communes). When given,
+        by_commune() also lists the communes with 0 accidents."""
         self.ds = dataset
+        self.reference = reference_communes
         self._accidents: pd.DataFrame | None = None
 
     # ---- accident-level table (one row per accident) ------------------
@@ -75,7 +83,7 @@ class CommuneAggregator:
         base = self.ds.caract.copy()
         base["hour"] = pd.to_numeric(base["hrmn"].astype(str).str[:2], errors="coerce")
 
-        lieux = self.ds.lieux.drop(columns=["dep", "com", "commune_name"], errors="ignore")
+        lieux = self.ds.lieux.drop(columns=["dep", "com"], errors="ignore")
         base = base.merge(lieux.drop_duplicates("Num_Acc"), on="Num_Acc",
                           how="left", suffixes=("", "_lieux"), validate="one_to_one")
 
@@ -103,8 +111,10 @@ class CommuneAggregator:
 
         try:
             immat = self.ds.immat
-            if self.AGE_COL in immat.columns:
-                age = immat.groupby("Num_Acc")[self.AGE_COL].mean().rename("mean_vehicle_age")
+            age_col = next((c for c in self.AGE_COLS if c in immat.columns), None)
+            if age_col:
+                age = (pd.to_numeric(immat[age_col], errors="coerce")
+                       .groupby(immat["Num_Acc"]).mean().rename("mean_vehicle_age"))
                 base = base.merge(age, on="Num_Acc", how="left")
         except KeyError:
             pass
@@ -122,7 +132,8 @@ class CommuneAggregator:
     # ---- grouped views -------------------------------------------------
     def by_commune(self) -> pd.DataFrame:
         a = self.accident_table()
-        out = a.groupby("commune_name").agg(
+        out = a.groupby("com").agg(
+            dep=("dep", "first"),
             accidents=("Num_Acc", "size"),
             vehicles=("n_vehicles", "sum"),
             users=("n_users", "sum"),
@@ -134,7 +145,9 @@ class CommuneAggregator:
             cyclists=("cyclists", "sum"),
             vulnerable_accidents=("vulnerable_involved", "sum"),
         )
+        out = self._add_empty_communes(out)
 
+        # Rates are NaN (undefined) for communes with 0 accidents, not 0.
         # Rule 1 - severity: killed + hospitalised people per 100 accidents
         out["severe_per_100_accidents"] = (
             (out["killed"] + out["hospitalised"]) / out["accidents"] * 100
@@ -148,9 +161,28 @@ class CommuneAggregator:
 
         return out.sort_values("accidents", ascending=False)
 
+    def _add_empty_communes(self, out: pd.DataFrame) -> pd.DataFrame:
+        """Append the reference communes that have no accident (all counts = 0)."""
+        if self.reference is None:
+            return out
+        ref = self.reference.drop_duplicates("com").set_index("com")
+        expected = set(ref.index)
+        # Official Paris code is 75056; if the file codes Paris differently
+        # ('75', '751xx'), do not report 75056 as an empty commune.
+        if any(str(c).startswith("75") for c in out.index):
+            expected.discard("75056")
+        missing = sorted(expected - set(out.index))
+
+        empty = pd.DataFrame(0, index=pd.Index(missing, name="com"),
+                             columns=[c for c in out.columns if c != "dep"])
+        empty.insert(0, "dep", ref.loc[missing, "dep"].values)
+        out = pd.concat([out, empty])
+        out["in_reference"] = out.index.isin(ref.index)   # False = code not in official list
+        return out
+
     def by_month(self) -> pd.DataFrame:
         a = self.accident_table()
-        return pd.crosstab(a["commune_name"], a["mois"], margins=True, margins_name="Total")
+        return pd.crosstab(a["com"], a["mois"], margins=True, margins_name="Total")
 
     def by_hour(self) -> pd.DataFrame:
         a = self.accident_table()
@@ -170,7 +202,7 @@ class CommuneAggregator:
 
     def by_vehicle_category(self) -> pd.DataFrame:
         v = self.ds.vehicules
-        return pd.crosstab(v["commune_name"], v["catv"])   # catv codes: see data dictionary
+        return pd.crosstab(v["com"], v["catv"])   # catv codes: see data dictionary
 
     # ---- output --------------------------------------------------------
     def all_aggregates(self) -> dict[str, pd.DataFrame]:
@@ -190,19 +222,14 @@ class CommuneAggregator:
             df.to_csv(folder / f"{name}.csv", index=name != "accidents")
 
 
-def build_periphery_dataset(dataset: BAACDataset, include_paris: bool = False) -> BAACDataset:
-    """Filter a national dataset to the périphérique communes (+ optionally Paris)."""
-    ring = dataset.filter_by_communes(
-        PERIPH_COMMUNES.keys(),
-        include_departments=["75"] if include_paris else (),
-    )
-    return ring.attach_geography(PERIPH_COMMUNES, resolver=name_resolver)
+def build_idf_dataset(dataset: BAACDataset) -> BAACDataset:
+    """Keep every accident of Île-de-France and attach dep / com to all tables."""
+    return dataset.filter_by_departments(IDF_DEPARTMENTS).attach_geography()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--year", type=int, default=2025)
-    parser.add_argument("--include-paris", action="store_true")
     parser.add_argument("--out", default="output_communes")
     args = parser.parse_args()
 
@@ -211,11 +238,14 @@ def main() -> None:
     national = BAACDataset.from_data_gouv(args.year)
     print(national)
 
-    ring = build_periphery_dataset(national, include_paris=args.include_paris)
-    print(ring)
-    print(ring.summary())
+    idf = build_idf_dataset(national)
+    print(idf)
+    print(idf.summary())
 
-    agg = CommuneAggregator(ring)
+    reference = fetch_idf_communes()
+    if reference is None:
+        log.warning("No reference list: communes with 0 accidents will not be listed.")
+    agg = CommuneAggregator(idf, reference_communes=reference)
     print(agg.by_commune())
     agg.export(args.out)
     print(f"\nExported to {Path(args.out).resolve()}")
