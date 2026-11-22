@@ -65,6 +65,7 @@ class CommuneAggregator:
     # Verify these codes against the 2025 data dictionary.
     PEDESTRIAN_CATU = 3
     CYCLIST_CATV = {1, 80}
+    EDV_CODES = (50, 60)   # e-scooter and e-bike (VAE) catv codes
 
     def __init__(self, dataset: BAACDataset,
                  reference_communes: pd.DataFrame | None = None):
@@ -93,6 +94,7 @@ class CommuneAggregator:
         u = self.ds.usagers.merge(veh_cat, on=["Num_Acc", "num_veh"], how="left")
         is_pedestrian = u["catu"].eq(self.PEDESTRIAN_CATU)
         is_cyclist = ~is_pedestrian & u["catv"].isin(self.CYCLIST_CATV)
+        is_edv = ~is_pedestrian & u["catv"].isin(self.EDV_CODES)
 
         flags = pd.DataFrame({
             "Num_Acc": u["Num_Acc"],
@@ -103,6 +105,7 @@ class CommuneAggregator:
             "light_injury": u["grav"].eq(4).astype(int),
             "pedestrians": is_pedestrian.astype(int),
             "cyclists": is_cyclist.astype(int),
+            "edv_users": is_edv.astype(int),
         })
         base = base.merge(flags.groupby("Num_Acc").sum(), on="Num_Acc", how="left")
 
@@ -120,11 +123,11 @@ class CommuneAggregator:
             pass
 
         count_cols = ["n_users", "unharmed", "killed", "hospitalised",
-                      "light_injury", "pedestrians", "cyclists", "n_vehicles"]
+                      "light_injury", "pedestrians", "cyclists", "edv_users", "n_vehicles"]
         base[count_cols] = base[count_cols].fillna(0).astype(int)
 
         # Accident-level flag used by the vulnerability rule
-        base["vulnerable_involved"] = (base["pedestrians"] + base["cyclists"]) > 0
+        base["vulnerable_involved"] = (base["pedestrians"] + base["cyclists"] + base["edv_users"]) > 0
 
         self._accidents = base
         return base
@@ -143,6 +146,7 @@ class CommuneAggregator:
             unharmed=("unharmed", "sum"),
             pedestrians=("pedestrians", "sum"),
             cyclists=("cyclists", "sum"),
+            edv_users=("edv_users", "sum"),
             vulnerable_accidents=("vulnerable_involved", "sum"),
         )
         out = self._add_empty_communes(out)
