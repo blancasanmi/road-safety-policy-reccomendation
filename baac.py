@@ -38,6 +38,52 @@ TABLE_KEYS = ("caract", "lieux", "usagers", "vehicules", "immat")
 CORE_TABLES = ("caract", "lieux", "usagers", "vehicules")   # every year must have these
 GEO_COLS = ["dep", "com", "commune_name"]
 
+# Vehicle categories (`catv`): (official French name, English name).
+# Standard BAAC nomenclature since 2019, typed from memory: check it against the official data
+# dictionary. A code that is not listed here is shown as "NOT IN MY LIST", never guessed.
+CATV_NAMES = {
+    -1: ("Non renseigné", "Not specified"),
+    0: ("Indéterminable", "Undetermined"),
+    1: ("Bicyclette", "Bicycle"),
+    2: ("Cyclomoteur < 50 cm3", "Moped < 50 cc"),
+    3: ("Voiturette (quadricycle à moteur carrossé)", "Light quadricycle (enclosed)"),
+    7: ("VL seul", "Car alone"),
+    10: ("VU seul 1,5T <= PTAC <= 3,5T", "Van alone"),
+    13: ("PL seul 3,5T < PTCA <= 7,5T", "Heavy goods vehicle 3.5-7.5 t"),
+    14: ("PL seul > 7,5T", "Heavy goods vehicle > 7.5 t"),
+    15: ("PL > 3,5T + remorque", "Heavy goods vehicle + trailer"),
+    16: ("Tracteur routier seul", "Road tractor alone"),
+    17: ("Tracteur routier + semi-remorque", "Road tractor + semi-trailer"),
+    20: ("Engin spécial", "Special machinery"),
+    21: ("Tracteur agricole", "Farm tractor"),
+    30: ("Scooter < 50 cm3", "Scooter < 50 cc"),
+    31: ("Motocyclette > 50 cm3 et <= 125 cm3", "Motorcycle 50-125 cc"),
+    32: ("Scooter > 50 cm3 et <= 125 cm3", "Scooter 50-125 cc"),
+    33: ("Motocyclette > 125 cm3", "Motorcycle > 125 cc"),
+    34: ("Scooter > 125 cm3", "Scooter > 125 cc"),
+    35: ("Quad léger <= 50 cm3", "Light quad <= 50 cc"),
+    36: ("Quad lourd > 50 cm3", "Heavy quad > 50 cc"),
+    37: ("Autobus", "Bus"),
+    38: ("Autocar", "Coach"),
+    39: ("Train", "Train"),
+    40: ("Tramway", "Tram"),
+    41: ("3RM <= 50 cm3", "Motorised 3-wheeler <= 50 cc"),
+    42: ("3RM > 50 cm3 <= 125 cm3", "Motorised 3-wheeler 50-125 cc"),
+    43: ("3RM > 125 cm3", "Motorised 3-wheeler > 125 cc"),
+    50: ("EDP à moteur", "Motorised personal device (e-scooter...)"),
+    60: ("EDP sans moteur", "Non-motorised personal device (kick scooter...)"),
+    80: ("VAE (vélo à assistance électrique)", "E-bike"),
+    99: ("Autre véhicule", "Other vehicle"),
+}
+
+
+def catv_name(code, lang: str = "fr") -> str:
+    """Name of a catv code ('fr' official French, 'en' English); flags unknown codes."""
+    if pd.isna(code):
+        return "(missing)"
+    names = CATV_NAMES.get(int(code))
+    return "NOT IN MY LIST" if names is None else names[0 if lang == "fr" else 1]
+
 
 def classify_title(title: str) -> str | None:
     """Map a file title to one of TABLE_KEYS ('immat' must be tested first)."""
@@ -251,6 +297,21 @@ class BAACDataset:
     @property
     def table_keys(self) -> tuple[str, ...]:
         return tuple(self._tables)
+
+    # ---- vehicle categories -------------------------------------------
+    def vehicle_category_counts(self) -> pd.Series:
+        """Number of vehicles per catv code (NaN counted as its own row)."""
+        catv = pd.to_numeric(self.vehicules["catv"], errors="coerce").astype("Int64")
+        return catv.value_counts(dropna=False).sort_index()
+
+    def users_with_vehicle(self, columns: Iterable[str] = ("catv",)) -> pd.DataFrame:
+        """Every user, with columns of the vehicle they were in (joined on Num_Acc + num_veh).
+
+        Pedestrians have no vehicle, so their vehicle columns are NaN.
+        """
+        veh = (self.vehicules[["Num_Acc", "num_veh", *columns]]
+               .drop_duplicates(["Num_Acc", "num_veh"]))
+        return self.usagers.merge(veh, on=["Num_Acc", "num_veh"], how="left")
 
     def check_year(self) -> None:
         """Raise if the tables are not those of `self.year`.
